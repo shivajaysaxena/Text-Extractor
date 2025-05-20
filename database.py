@@ -28,10 +28,14 @@ class ImageDatabase:
     def save_image_data(self, image_path, extracted_text, common_word, image_hash):
         cursor = self.conn.cursor()
         try:
+            # Normalize text before saving
+            common_word = common_word.lower().strip()
+            extracted_text = extracted_text.strip()
+            
             cursor.execute('''
                 INSERT INTO images (image_path, extracted_text, common_word, image_hash, created_at)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (image_path, extracted_text, common_word.lower(), image_hash, datetime.now()))
+            ''', (image_path, extracted_text, common_word, image_hash, datetime.now()))
             self.conn.commit()
             
             # Verify the save operation
@@ -47,12 +51,19 @@ class ImageDatabase:
     def get_common_words(self):
         cursor = self.conn.cursor()
         try:
-            cursor.execute('SELECT DISTINCT common_word FROM images WHERE common_word IS NOT NULL')
-            words = [row[0] for row in cursor.fetchall()]
-            print(f"Found common words: {words}")  # Debug print
+            # Use COLLATE NOCASE for case-insensitive comparison
+            cursor.execute('''
+                SELECT DISTINCT common_word 
+                FROM images 
+                WHERE common_word IS NOT NULL 
+                COLLATE NOCASE
+                ORDER BY common_word
+            ''')
+            words = [row[0].lower() for row in cursor.fetchall() if row[0]]
+            print(f"Found common words: {words}")
             return words
         except Exception as e:
-            print(f"Error getting common words: {e}")  # Debug print
+            print(f"Error getting common words: {e}")
             return []
 
     def check_image_exists(self, image_hash):
@@ -64,5 +75,18 @@ class ImageDatabase:
 
     def get_images_by_common_word(self, common_word):
         cursor = self.conn.cursor()
-        cursor.execute('SELECT image_path, extracted_text FROM images WHERE common_word = ?', (common_word,))
-        return cursor.fetchall()
+        try:
+            search_term = common_word.lower().strip()
+            # Improved search query to check partial matches and extracted text
+            cursor.execute('''
+                SELECT DISTINCT image_path, extracted_text 
+                FROM images 
+                WHERE LOWER(common_word) LIKE ? 
+                OR LOWER(extracted_text) LIKE ? 
+                OR ? LIKE '%' || LOWER(common_word) || '%'
+                ORDER BY created_at DESC
+            ''', (f"%{search_term}%", f"%{search_term}%", search_term))
+            return cursor.fetchall()
+        except Exception as e:
+            print(f"Error searching images: {e}")
+            return []

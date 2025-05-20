@@ -17,9 +17,9 @@ class TextProcessor:
         return enhanced
 
     def filter_signboard_region(self, image):
-        # Focus on top third of image where signboards usually appear
+        # Consider top half of image instead of just top third
         height = image.shape[0]
-        top_portion = image[0:int(height/3), :]
+        top_portion = image[0:int(height/2), :]
         return top_portion
 
     def extract_text(self, image_path):
@@ -58,18 +58,37 @@ class TextProcessor:
         if not text:
             return None
             
-        # Split into words and clean
-        words = text.lower().split()
-        # Filter out common words and short words
-        stop_words = {'the', 'and', 'for', 'ltd', 'limited', 'pvt', 'private'}
-        words = [word for word in words 
-                if len(word) > 2 
-                and word not in stop_words 
-                and not word.isdigit()]
+        # Normalize and split text
+        words = text.lower().strip().split()
+        
+        # Business-related keywords to prioritize
+        business_words = {
+            'traders', 'store', 'shop', 'stores', 'mobile', 'general', 
+            'electronics', 'services', 'recharge', 'sales', 'trading'
+        }
+        
+        # Enhanced stop words list
+        stop_words = {
+            'the', 'and', 'for', 'ltd', 'limited', 'pvt', 'private',
+            'cell', 'ph', 'phone', 'mob', 'mobile', 'all', 'available',
+            'sim', 'cards', 'road', 'download'
+        }
+        
+        # Filter words and numbers
+        words = [
+            word for word in words 
+            if (len(word) > 2 and 
+                word not in stop_words and 
+                not any(char.isdigit() for char in word))
+        ]
         
         if not words:
             return None
-            
-        # Get most common significant word
-        word_counts = Counter(words)
-        return word_counts.most_common(1)[0][0]
+        
+        # Prioritize business-related words
+        business_related = [word for word in words if word in business_words]
+        if business_related:
+            return max(business_related, key=len)
+        
+        # If no business words found, use the longest non-stop word
+        return max(words, key=len)
