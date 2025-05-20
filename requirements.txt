@@ -1,0 +1,7 @@
+streamlit
+easyocr
+Pillow
+numpy
+pandas
+torch
+opencv-python-headless
