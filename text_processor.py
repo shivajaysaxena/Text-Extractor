@@ -1,6 +1,9 @@
 import easyocr
+import pytesseract
+import google.generativeai as genai
 import cv2
 import numpy as np
+import os
 from PIL import Image
 from scipy.ndimage import label
 from difflib import SequenceMatcher
@@ -8,8 +11,12 @@ from collections import Counter
 
 class TextProcessor:
     def __init__(self):
-        # Initialize with multiple languages for better accuracy
-        self.reader = easyocr.Reader(['en'], gpu=False)
+        self.easyocr_reader = easyocr.Reader(['en'])
+        
+        # Configure Gemini with API key directly
+        GEMINI_API_KEY = "AIzaSyAIO5ed_pT75Uny0CWA0B1kHTngo6O4-Ps"  # Replace with your actual API key
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel('gemini-pro-vision')
         
         # Define validation parameters
         self.min_confidence = 0.45
@@ -163,138 +170,175 @@ class TextProcessor:
         if image is None:
             return [], None
             
-        # Get text using both approaches
-        results = []
+        # Get text using EasyOCR
+        results = self.easyocr_reader.readtext(image)
         
-        # Get segmentation results
-        signboards = self.detect_signboards(image)
-        for (x,y,w,h) in signboards:
-            roi = image[y:y+h, x:x+w]
-            detections = self.reader.readtext(roi)
-            for detection in detections:
-                if len(detection) == 3:
-                    box, text, conf = detection
-                    if conf > self.min_confidence:
-                        results.append(text)
+        # Filter and process results
+        valid_detections = []
+        for r in results:
+            if len(r) == 3:
+                box, text, conf = r
+                if conf > 0.4:
+                    valid_detections.append((box, text, conf))
         
-        # Group results into text blocks
-        text_groups = []
-        if results:
-            text_groups = [results]  # Single group for now, can be enhanced
-            
+        # Use Gemini for analysis if available
+        try:
+            organized_text = self.analyze_with_gemini(image_path, ' '.join(t[1] for t in valid_detections))
+        except Exception as e:
+            print(f"Gemini analysis failed: {e}")
+            organized_text = self.basic_organize_text([t[1] for t in valid_detections])
+        
         # Create visualization
-        visualized = self.draw_results(image, text_groups)
+        visualized = self.draw_results(image, valid_detections)
         
-        # Clean up text groups before returning
-        text_groups = [[str(text) for text in group] for group in text_groups]
-        
-        return text_groups, visualized
+        return [organized_text], visualized
 
-    def get_segmentation_results(self, image):
-        signboards = self.detect_signboards(image)
-        results = []
-        
-        for (x,y,w,h) in signboards:
-            roi = image[y:y+h, x:x+w]
-            detections = self.reader.readtext(roi)
-            
-            for detection in detections:
-                if len(detection) == 3:
-                    box, text, conf = detection
-                    if conf > self.min_confidence:
-                        # Adjust coordinates to original image
-                        adjusted_box = np.array(box) + [x, y]
-                        results.append((adjusted_box.tolist(), text, conf, (x+w/2, y+h/2)))
-        
-        return results
-
-    def get_clustering_results(self, image):
-        # Find text-dense regions
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5,5), 0)
-        
-        # Get raw OCR results
-        detections = self.reader.readtext(blur)
-        results = []
-        
-        for detection in detections:
-            if len(detection) == 3:
-                box, text, conf = detection
-                if conf > self.min_confidence:
-                    center = np.mean(box, axis=0)
-                    results.append((box, text, conf, tuple(center)))
-        
-        return results
-
-    def merge_detection_results(self, seg_results, cluster_results):
-        merged = []
-        used_positions = set()
-        
-        # Add all segmentation results
-        for result in seg_results:
-            box, text, conf, center = result
-            merged.append(result)
-            used_positions.add(center)
-        
-        # Add clustering results that don't overlap
-        for result in cluster_results:
-            box, text, conf, center = result
-            if not any(self.points_close(center, pos, self.text_cluster_distance) 
-                      for pos in used_positions):
-                merged.append(result)
-                used_positions.add(center)
-        
-        return merged
-
-    def group_text_by_proximity(self, results):
-        if not results:
+    def get_easyocr_text(self, image):
+        try:
+            results = self.easyocr_reader.readtext(image)
+            return [(r[0], r[1], r[2]) for r in results if r[2] > 0.4]
+        except Exception as e:
+            print(f"EasyOCR error: {e}")
             return []
-            
-        # Sort by vertical position
-        results.sort(key=lambda x: x[3][1])  # Sort by y-coordinate of center
-        
-        groups = []
-        current_group = [results[0][1]]  # Start with first text
-        last_y = results[0][3][1]
-        
-        for result in results[1:]:
-            text = result[1]
-            current_y = result[3][1]
-            
-            if current_y - last_y > self.text_cluster_distance:
-                groups.append(current_group)
-                current_group = []
-            
-            current_group.append(text)
-            last_y = current_y
-            
-        if current_group:
-            groups.append(current_group)
-            
-        return groups
 
-    def points_close(self, p1, p2, threshold):
-        return np.sqrt(((p1[0]-p2[0])**2) + ((p1[1]-p2[1])**2)) < threshold
+    def get_tesseract_text(self, image):
+        try:
+            # Preprocess for Tesseract
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            
+            # Get text
+            text = pytesseract.image_to_string(thresh)
+            return text.strip()
+        except Exception as e:
+            print(f"Tesseract error: {e}")
+            return ""
+
+    def merge_ocr_results(self, easy_results, tess_results):
+        merged_text = []
+        
+        # Add EasyOCR results
+        for box, text, conf in easy_results:
+            if text.strip():
+                merged_text.append(text.strip())
+        
+        # Add Tesseract results
+        if tess_results:
+            merged_text.extend([t for t in tess_results.split('\n') if t.strip()])
+        
+        return ' '.join(merged_text)
+
+    def analyze_with_gemini(self, image_path, text):
+        try:
+            # Prepare image for Gemini
+            image = cv2.imread(image_path)
+            _, encoded_img = cv2.imencode('.jpg', image)
+            image_bytes = encoded_img.tobytes()
+            
+            # Create prompt
+            prompt = f"""
+            Analyze this shop signboard image and extracted text: {text}
+            
+            1. Identify the business name
+            2. Identify products/services offered
+            3. Extract contact information
+            4. Extract location details if any
+            
+            Format the response as:
+            Business Name: [name]
+            Products/Services: [list]
+            Contact: [details]
+            Location: [address]
+            """
+            
+            # Get Gemini response
+            response = self.model.generate_content([prompt, image_bytes])
+            
+            return response.text
+        except Exception as e:
+            print(f"Gemini error: {e}")
+            # Fallback to basic organization
+            return self.basic_organize_text(text)
+
+    def basic_organize_text(self, text_list):
+        # Basic fallback organization if Gemini fails
+        text_info = {
+            'business_name': [],
+            'products': [],
+            'contact': [],
+            'address': [],
+            'other': []
+        }
+        
+        # Handle input whether it's a string or list
+        if isinstance(text_list, str):
+            text_list = [text_list]
+        
+        for text in text_list:
+            cleaned_text = str(text).strip()
+            if any(char.isdigit() for char in cleaned_text):
+                if len(cleaned_text) > 8:  # Likely phone/mobile
+                    text_info['contact'].append(cleaned_text)
+                else:
+                    text_info['other'].append(cleaned_text)
+            elif any(word in cleaned_text.lower() for word in ['road', 'street', 'lane', 'nagar']):
+                text_info['address'].append(cleaned_text)
+            elif any(word in cleaned_text.lower() for word in ['shop', 'store', 'traders', 'collection']):
+                text_info['business_name'].append(cleaned_text)
+            elif any(word in cleaned_text.lower() for word in ['stationary', 'gift', 'general', 'mobile', 'services']):
+                text_info['products'].append(cleaned_text)
+            else:
+                text_info['other'].append(cleaned_text)
+        
+        # Format organized text
+        formatted_text = []
+        for category, texts in text_info.items():
+            if texts:
+                if category == 'business_name':
+                    formatted_text.insert(0, f"Business Name: {' '.join(texts)}")
+                elif category == 'products':
+                    formatted_text.append(f"Products/Services: {', '.join(texts)}")
+                elif category == 'contact':
+                    formatted_text.append(f"Contact: {', '.join(texts)}")
+                elif category == 'address':
+                    formatted_text.append(f"Address: {' '.join(texts)}")
+        
+        return '\n'.join(formatted_text) if formatted_text else "No structured information found"
 
     def draw_results(self, image, text_groups):
         output = image.copy()
         overlay = image.copy()
         
-        # Draw each text group
-        y_offset = 30  # Starting y position for text display
-        for group in text_groups:
-            # Create a text block for this group
-            text_block = ' '.join(group)
-            
-            # Add text to image
-            cv2.putText(output, text_block, 
-                       (10, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.7, (0, 255, 0), 2)
-            
-            y_offset += 30  # Move down for next text block
+        # Handle case where text_groups contains detection tuples
+        if text_groups and isinstance(text_groups[0], tuple):
+            # Draw OCR boxes and text
+            for box, text, conf in text_groups:
+                points = np.array(box).astype(np.int32)
+                # Draw filled polygon for text region
+                cv2.fillPoly(overlay, [points], (0, 255, 0, 0.3))
+                # Draw text boundary
+                cv2.polylines(output, [points], True, (0, 255, 0), 2)
+                # Add text and confidence
+                cv2.putText(output, f"{text}", 
+                           tuple(points[0]), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 
+                           0.7, (0, 0, 255), 2)
+        else:
+            # Handle case where text_groups contains strings
+            y_offset = 30
+            for text in text_groups:
+                if isinstance(text, (list, tuple)):
+                    text = ' '.join(str(t) for t in text)
+                else:
+                    text = str(text)
+                    
+                cv2.putText(output, text,
+                           (10, y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX,
+                           0.7, (0, 255, 0), 2)
+                y_offset += 30
         
-        # Add semi-transparent overlay
+        # Blend overlay with original
         alpha = 0.3
         output = cv2.addWeighted(overlay, alpha, output, 1 - alpha, 0)
         
@@ -403,36 +447,25 @@ class TextProcessor:
         if image is None:
             return [], None
             
-        # Get text using both approaches
-        results = []
+        # Get text using EasyOCR
+        results = self.easyocr_reader.readtext(image)
         
-        # Get segmentation results
-        signboards = self.detect_signboards(image)
-        for (x,y,w,h) in signboards:
-            roi = image[y:y+h, x:x+w]
-            detections = self.reader.readtext(roi)
-            for detection in detections:
-                if len(detection) == 3:
-                    box, text, conf = detection
-                    if conf > self.min_confidence:
-                        results.append(text)
+        # Filter and process results
+        valid_detections = []
+        for r in results:
+            if len(r) == 3:
+                box, text, conf = r
+                if conf > 0.4:
+                    valid_detections.append((box, text, conf))
         
-        # Group results into text blocks
-        text_groups = []
-        if results:
-            text_groups = [results]  # Single group for now, can be enhanced
-            
+        # Use Gemini for analysis if available
+        try:
+            organized_text = self.analyze_with_gemini(image_path, ' '.join(t[1] for t in valid_detections))
+        except Exception as e:
+            print(f"Gemini analysis failed: {e}")
+            organized_text = self.basic_organize_text([t[1] for t in valid_detections])
+        
         # Create visualization
-        visualized = self.draw_results(image, text_groups)
+        visualized = self.draw_results(image, valid_detections)
         
-        # Clean up text groups before returning
-        text_groups = [[str(text) for text in group] for group in text_groups]
-        
-        # Process results through organizer
-        organized_texts = []
-        for group in text_groups:
-            organized_text = self.organize_text(group)
-            if organized_text:
-                organized_texts.append(organized_text)
-        
-        return organized_texts, visualized
+        return [organized_text], visualized
