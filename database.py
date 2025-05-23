@@ -28,9 +28,15 @@ class ImageDatabase:
     def save_image_data(self, image_path, extracted_text, common_word, image_hash):
         cursor = self.conn.cursor()
         try:
+            # Handle organized text format
+            if isinstance(extracted_text, list):
+                extracted_text = '\n'.join(str(t) for t in extracted_text)
+            
             # Normalize text before saving
-            common_word = common_word.lower().strip()
-            extracted_text = extracted_text.strip()
+            common_word = str(common_word).lower().strip()
+            extracted_text = str(extracted_text).strip()
+            
+            print(f"Saving - Common word: {common_word}, Hash: {image_hash}")  # Debug
             
             cursor.execute('''
                 INSERT INTO images (image_path, extracted_text, common_word, image_hash, created_at)
@@ -38,32 +44,36 @@ class ImageDatabase:
             ''', (image_path, extracted_text, common_word, image_hash, datetime.now()))
             self.conn.commit()
             
-            # Verify the save operation
-            cursor.execute('SELECT COUNT(*) FROM images WHERE image_hash = ?', (image_hash,))
-            if cursor.fetchone()[0] > 0:
-                print(f"Successfully saved image with hash {image_hash}")  # Debug print
+            # Verify the save
+            cursor.execute('SELECT * FROM images WHERE image_hash = ?', (image_hash,))
+            saved_data = cursor.fetchone()
+            if saved_data:
+                print(f"Saved data: {saved_data}")  # Debug
                 return True
             return False
         except Exception as e:
-            print(f"Error saving to database: {e}")  # Debug print
+            print(f"Error saving to database: {e}")  # Debug
             return False
 
     def get_common_words(self):
         cursor = self.conn.cursor()
         try:
-            # Use COLLATE NOCASE for case-insensitive comparison
+            # Improved query to ensure we get results
             cursor.execute('''
-                SELECT DISTINCT common_word 
+                SELECT DISTINCT common_word, COUNT(*) as count
                 FROM images 
                 WHERE common_word IS NOT NULL 
-                COLLATE NOCASE
-                ORDER BY common_word
+                AND length(common_word) > 0
+                GROUP BY common_word
+                ORDER BY count DESC, common_word ASC
             ''')
             words = [row[0].lower() for row in cursor.fetchall() if row[0]]
-            print(f"Found common words: {words}")
+            print(f"Found {len(words)} common words: {words}")  # Debug
             return words
         except Exception as e:
             print(f"Error getting common words: {e}")
+            cursor.execute('SELECT * FROM images')  # Debug - check table content
+            print(f"Total records: {len(cursor.fetchall())}")
             return []
 
     def check_image_exists(self, image_hash):
