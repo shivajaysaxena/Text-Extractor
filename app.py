@@ -29,39 +29,36 @@ def upload_page(db, processor):
         st.image(image, caption="Uploaded Image", use_column_width=True)
         
         if st.button("Extract Text"):
-            try:
-                temp_path = save_uploaded_file(uploaded_file)
-                st.info(f"File saved at: {temp_path}")
-                
-                image_hash = get_image_hash(temp_path)
-                st.info(f"Image hash calculated: {image_hash[:10]}...")
-                
-                # Check if image already exists
-                if db.check_image_exists(image_hash):
-                    st.warning("This image has already been processed!")
-                    os.remove(temp_path)  # Remove temporary file
-                    return
-                
-                extracted_text = processor.extract_text(temp_path)
-                if not extracted_text:
-                    st.error("No text could be extracted from the image")
-                    return
-                    
-                st.write("Extracted Text:")
-                st.write(extracted_text)
-                
-                common_word = processor.find_common_word(extracted_text)
-                if common_word:
-                    st.write(f"Common Word: {common_word}")
-                    success = db.save_image_data(temp_path, extracted_text, common_word, image_hash)
-                    if success:
-                        st.success("Image processed and saved successfully!")
-                    else:
-                        st.error("Failed to save to database")
-                else:
-                    st.warning("No common word could be found in the extracted text")
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
+            temp_path = save_uploaded_file(uploaded_file)
+            
+            # Extract text and get visualization
+            shops_text, visualized = processor.extract_text(temp_path)
+            
+            # Display extracted text for each shop
+            st.subheader("Extracted Text:")
+            for i, shop_text in enumerate(shops_text, 1):
+                with st.expander(f"Shop {i}"):
+                    st.write(shop_text)
+                    common_word = processor.find_common_word(shop_text)
+                    if common_word:
+                        st.write(f"Common Word: {common_word}")
+                        # Save to database
+                        image_hash = get_image_hash(temp_path)
+                        if not db.check_image_exists(image_hash):
+                            db.save_image_data(temp_path, shop_text, common_word, image_hash)
+            
+            # Show OCR visualization
+            st.subheader("Text Detection Visualization")
+            st.image(visualized, caption="Detected Text", use_column_width=True)
+            
+            # Add download button for OCR visualization
+            with open('temp_ocr_vis.jpg', 'rb') as file:
+                btn = st.download_button(
+                    label="Download OCR Visualization",
+                    data=file,
+                    file_name="ocr_visualization.jpg",
+                    mime="image/jpeg"
+                )
 
 def search_page(db):
     st.header("Search Images by Common Word")
