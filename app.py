@@ -31,21 +31,20 @@ def upload_page(db, processor):
         if st.button("Extract Text"):
             temp_path = save_uploaded_file(uploaded_file)
             
-            # Extract text and get visualization
-            shops_text, visualized = processor.extract_text(temp_path)
+            # Extract text and get visualization with common phrase
+            shops_text, visualized, common_phrase = processor.extract_text(temp_path)
             
             # Display extracted text for each shop
             st.subheader("Extracted Text:")
             for i, shop_text in enumerate(shops_text, 1):
                 with st.expander(f"Shop {i}"):
                     st.write(shop_text)
-                    common_word = processor.find_common_word(shop_text)
-                    if common_word:
-                        st.write(f"Common Word: {common_word}")
-                        # Save to database
+                    if common_phrase:
+                        st.write(f"Key Phrase: {common_phrase}")
+                        # Save to database using extracted phrase
                         image_hash = get_image_hash(temp_path)
                         if not db.check_image_exists(image_hash):
-                            db.save_image_data(temp_path, shop_text, common_word, image_hash)
+                            db.save_image_data(temp_path, shop_text, common_phrase, image_hash)
             
             # Show OCR visualization
             st.subheader("Text Detection Visualization")

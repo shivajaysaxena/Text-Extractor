@@ -1,471 +1,786 @@
-import easyocr
-import pytesseract
-import google.generativeai as genai
+import warnings
+warnings.filterwarnings('ignore')
+import logging
+logging.getLogger().setLevel(logging.ERROR)
+
 import cv2
 import numpy as np
-import os
-from PIL import Image
-from scipy.ndimage import label
-from difflib import SequenceMatcher
+import pytesseract
+import easyocr
 from collections import Counter
+from sklearn.cluster import DBSCAN
+import re
+from PIL import Image
 
 class TextProcessor:
     def __init__(self):
-        self.easyocr_reader = easyocr.Reader(['en'])
+        print("[Init] Initializing TextProcessor...")
+        # Initialize parameters
+        self.min_confidence = 0.05
+        self.easyocr_conf = 0.1
         
-        # Configure Gemini with API key directly
-        GEMINI_API_KEY = "AIzaSyAIO5ed_pT75Uny0CWA0B1kHTngo6O4-Ps"  # Replace with your actual API key
-        genai.configure(api_key=GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemini-pro-vision')
+        # Update OCR params for better detection
+        self.ocr_params = {
+            'paragraph': False,  # Process as individual words
+            'batch_size': 8,
+            'min_size': 10,     # Detect smaller text
+            'text_threshold': 0.05,  # More sensitive text detection
+            'low_text': 0.3,    # Better for dark text
+            'contrast_ths': 0.05,# More sensitive to contrast
+            'width_ths': 0.3,   # Allow wider text
+            'height_ths': 0.3,  # Allow taller text
+            'mag_ratio': 2.0    # Larger magnification
+        }
         
-        # Define validation parameters
-        self.min_confidence = 0.45
-        self.min_text_length = 3
-        self.max_text_length = 50
-        self.valid_chars_ratio = 0.65
-        self.text_cluster_distance = 30  # pixels
-
-    def preprocess_image(self, image):
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Apply adaptive thresholding
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
+        # Initialize EasyOCR with basic settings
+        self.easyocr_reader = easyocr.Reader(
+            ['en'],
+            gpu=False,
+            model_storage_directory='./models',
+            download_enabled=True,
+            recog_network='english_g2'
         )
-        
-        # Denoise image
-        denoised = cv2.fastNlMeansDenoising(thresh)
-        
-        # Enhance contrast
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(denoised)
-        
-        # Sharpen image
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(enhanced, -1, kernel)
-        
-        return sharpened
 
-    def filter_signboard_region(self, image):
-        # Consider top half of image instead of just top third
-        height = image.shape[0]
-        top_portion = image[0:int(height/2), :]
-        return top_portion
+        self.priority_patterns = {
+            'bakery': [r'(?i)[a-z\s]*b[a@]k[e3]r[yi]e?s?'],
+            'store': [r'(?i)(gen[e3]r[a@]l)?\s*st[o0]r[e3]s?'],
+            'shop': [r'(?i)sh[o0]ps?'],
+            'gift': [r'(?i)g[i1]fts?\s*sh[o0]p']
+        }
+        
+        self.text_cleanup = {
+            'numbers': [r'\d+', ''],
+            'special': [r'[^\w\s&-]', ''],
+            'spaces': [r'\s+', ' ']
+        }
+        
+        # Enhanced business categorization with priorities
+        self.business_categories = {
+            'bakery': 10,  # Prioritize bakery
+            'general store': 9,
+            'gift shop': 8,
+            'stationery': 8,
+            'mobile': 7,
+            'general': 6,
+            'store': 5,
+            'shop': 4
+        }
+        
+        # Priority words for shop types
+        self.priority_words = {
+            'bakery': {'bakery', 'bake', 'fresh', 'bread', 'cake', 'sweet', 'confectionery'},
+            'stationery': {'stationery', 'book', 'pen', 'paper', 'gift'},
+            'general': {'general', 'store', 'shop', 'mart', 'emporium', 'traders'},
+            'mobile': {'mobile', 'phone', 'cell', 'recharge', 'accessories'}
+        }
+        
+        # Add specialized bakery patterns
+        self.text_patterns = {
+            'shop_name': [
+                r'(?i)[a-z]*\s*b[a@]k[e3]ry',  # Any word followed by bakery
+                r'(?i)b[a@]k[e3]r[sy]?\s*[a-z]*',  # Bakery followed by any word
+                r'(?i)n[o0]{2}r\s*b[a@]k[e3]ry',  # Match NOOR BAKERY with variations
+                r'(?i)s[h#]r[e3]{2}\s*[a@]rt',  # Match SHREE ART
+                r'(?i)g[i1]ft\s*sh[o0]p'  # Match GIFT SHOP
+                r'(?i)st[a@]t[i1][o0]n[e3]ry'  # Match STATIONERY variations
+            ],
+            'business_type': [
+                r'(?i)g[e3]n[e3]r[a@]l\s*st[o0]r[e3]s?',  # Match GENERAL STORE(S)
+                r'(?i)st[a@]t[i1][o0]n[e3]ry\s*sh[o0]p',  # Match STATIONERY SHOP
+                r'(?i)b[o0]{2}k\s*sh[o0]p',  # Match BOOK SHOP
+                r'(?i)b[a@]k[e3]ry'  # Match BAKERY
+            ]
+        }
+        self.min_area_ratio = 0.01  # Reduced for smaller signboards
+        self.min_signboard_width = 100  # Reduced for smaller signs
+        self.max_signboard_height = 300  # Increased for taller signs
+        self.min_text_height = 12  # Further reduced
+        self.cluster_distance = 40  # Increased for better line grouping
+        self.edge_density_threshold = 0.1  # Lower threshold for edge density
+        self.min_area_ratio = 0.01  # Reduced for smaller signboards
+        self.min_text_area = 50  # Minimum area for text regions
+        self.min_text_width = 20  # Minimum width for text regions
+        self.min_text_height = 10  # Minimum height for text regions
+        self.max_text_width = 500  # Maximum width for text regions
+        self.max_text_height = 200  # Maximum height for text regions
+        self.max_text_regions = 10  # Limit number of text regions
+        self.min_text_ratio = 0.1  # Minimum ratio of text area to signboard area
+        self.min_text_confidence = 0.3  # Minimum confidence for text detection
+        
+        # Additional parameters for text processing
+        self.ignored_words = {'the', 'and', 'for', 'in', 'at', 'of', 'to', 'a', 'an'}
+        self.max_word_repeats = 2  # Limit repeated words
+        self.min_word_length = 3
 
-    def find_text_regions(self, image):
-        # Create binary mask of text regions
+        self.char_sequences = {
+            'common': ['th', 'er', 'on', 'an', 'en', 'es', 'ing', 'ion'],
+            'shop': ['shop', 'store', 'mart', 'center', 'point']
+        }
+        self.min_word_conf = 0.2  # Increased threshold
+
+        # Add text correction parameters
+        self.word_similarity_threshold = 0.7
+        self.word_distance_threshold = 0.2
+        self.common_words = {
+            'brothers', 'traders', 'center', 'point', 'mart', 
+            'store', 'shop', 'sales', 'service'
+        }
+
+        # Add language and visualization parameters
+        self.lang_detector = re.compile(r'[a-zA-Z]')
+        self.min_english_ratio = 0.5
+        self.draw_boxes = True
+        self.font = cv2.FONT_HERSHEY_SIMPLEX
+        self.box_color = (0, 255, 0)  # Green
+        self.text_color = (255, 0, 0)  # Blue
+
+        # Add context-specific word groups
+        self.word_groups = {
+            'business_prefix': {'sri', 'shree', 'shri', 'new', 'the'},
+            'business_suffix': {'traders', 'trading', 'store', 'stores', 'shop', 'mart', 'centre', 'center'},
+            'common_names': {'bhagwan', 'bhagawan', 'krishna', 'ram', 'shiva'},
+            'business_types': {'mobile', 'phones', 'grocery', 'general', 'gift', 'bakery'}
+        }
+
+        # Enhanced mobile shop specific patterns
+        self.shop_patterns = {
+            'mobile': {
+                'prefixes': {'zs', 'ss', 'ms', 'rs'},
+                'core_terms': {'mobile', 'phone', 'cell', 'tel'},
+                'suffixes': {'point', 'shop', 'store', 'traders', 'centre'},
+                'services': {'repair', 'service', 'accessories', 'recharge'}
+            }
+        }
+        
+        # Enhanced corrections dictionary
+        self.word_corrections = {
+            'PH': 'PHONE',
+            'MOB': 'MOBILE',
+            'MOBL': 'MOBILE',
+            'MOBIL': 'MOBILE',
+            'PHON': 'PHONE',
+            'FONE': 'PHONE',
+            'TEL': 'TELEPHONE',
+            'TRDRS': 'TRADERS',
+            'TRADRS': 'TRADERS',
+            'CENTR': 'CENTRE',
+            'CTR': 'CENTRE',
+            'ACCESSOR': 'ACCESSORIES'
+        }
+
+        # Add confidence weights for different detection methods
+        self.confidence_weights = {
+            'easyocr': 1.2,
+            'tesseract': 1.0,
+            'positional': 1.1
+        }
+
+        # Enhanced segmentation parameters for bakery signs
+        self.segment_params = {
+            'min_area': 100,      # Reduced for smaller text
+            'max_area': 20000,    # Reduced to avoid over-segmentation
+            'min_ratio': 0.15,    # More permissive ratio
+            'max_ratio': 12.0,    # Allow longer text
+            'padding': 8,         # Increased padding
+            'cluster_eps': 35,    # More precise clustering
+            'cluster_min_samples': 2,  # Require at least 2 samples
+            'overlap_threshold': 0.3,  # Allow more overlap
+            'height_similarity': 0.7,  # Height similarity threshold
+            'vertical_gap': 0.5,   # Maximum vertical gap ratio
+            'horizontal_gap': 1.5  # Maximum horizontal gap ratio
+        }
+
+        # Text clustering with multi-scale approach
+        self.text_cluster_params = {
+            'distance_threshold': 0.4,    # Stricter distance
+            'confidence_weight': 0.5,     # Balanced confidence
+            'position_weight': 0.5,       # Equal position weight
+            'min_cluster_size': 2,        # Require pairs
+            'scales': [0.8, 1.0, 1.2],   # Multi-scale detection
+            'merge_threshold': 0.6,       # Merge similar detections
+            'line_height_ratio': 1.5,     # Line height similarity
+            'word_gap_ratio': 3.0        # Maximum word gap
+        }
+
+        # Add bakery-specific parameters
+        self.bakery_params = {
+            'keywords': ['bakery', 'bake', 'bread', 'cake', 'pastry', 'sweet'],
+            'min_keyword_conf': 0.3,   # Lower threshold for keywords
+            'name_patterns': [
+                r'(?i)n[o0]{2}r',     # NOOR variations
+                r'(?i)gr[e3]{2}n',    # GREEN variations
+                r'(?i)b[e3]rg'        # BERG variations
+            ],
+            'layout_weights': {
+                'centered': 1.2,       # Boost centered text
+                'stacked': 1.1,        # Boost stacked layout
+                'large_text': 1.3      # Boost larger text
+            }
+        }
+
+    def find_signboard(self, image):
+        print("\n[Signboard] Detecting signboard region...")
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        # Enhanced preprocessing
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        blur = cv2.GaussianBlur(enhanced, (3,3), 0)
         
-        # Find connected components (text regions)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15,3))
-        dilate = cv2.dilate(thresh, kernel, iterations=2)
+        # More sensitive edge detection
+        edges1 = cv2.Canny(blur, 20, 100)  # Lower thresholds
+        edges2 = cv2.Canny(blur, 40, 150)
+        edges3 = cv2.Sobel(blur, cv2.CV_64F, 1, 0, ksize=3)
+        edges = cv2.bitwise_or(edges1, edges2)
+        edges = cv2.bitwise_or(edges, np.uint8(np.absolute(edges3)))
         
-        # Label connected regions
-        labels, num = label(dilate)
+        # Connect components
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (20,1))
+        kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1,5))
+        dilated_h = cv2.dilate(edges, kernel_h, iterations=2)
+        dilated_v = cv2.dilate(edges, kernel_v, iterations=1)
+        dilated = cv2.bitwise_or(dilated_h, dilated_v)
         
-        # Find regions with high text density
-        regions = []
-        for i in range(1, num + 1):
-            mask = (labels == i).astype(np.uint8)
-            if cv2.countNonZero(mask) > 100:  # Filter small regions
-                x, y, w, h = cv2.boundingRect(mask)
-                density = cv2.countNonZero(mask) / (w * h)
-                if density > 0.3:  # Only keep dense text regions
-                    regions.append((x, y, w, h))
-        
-        return regions
-
-    def draw_ocr_results(self, image, results):
-        output = image.copy()
-        overlay = image.copy()
-        
-        for (box, text, conf) in results:
-            points = np.array(box).astype(np.int32)
-            # Draw filled polygon for text region
-            cv2.fillPoly(overlay, [points], (0, 255, 0, 0.3))
-            # Draw text boundary
-            cv2.polylines(output, [points], True, (0, 255, 0), 2)
-            # Add text and confidence
-            cv2.putText(output, f"{text} ({conf:.2f})", 
-                       tuple(points[0]), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        
-        # Blend overlay with original
-        alpha = 0.3
-        output = cv2.addWeighted(overlay, alpha, output, 1 - alpha, 0)
-        
-        return output
-
-    def detect_signboards(self, image):
-        # Convert to grayscale
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (7,7), 0)
-        
-        # Edge detection
-        edges = cv2.Canny(blur, 50, 150)
-        
-        # Dilate edges to connect components
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
-        dilated = cv2.dilate(edges, kernel, iterations=2)
-        
-        # Find contours
         contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # Filter potential signboard regions
-        signboards = []
+        candidates = []
+        img_height, img_width = image.shape[:2]
+        min_area = max(img_width * img_height * self.min_area_ratio, 
+                      self.min_signboard_width * self.min_text_height)
+        
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < 1000:  # Filter small regions
+            if area < min_area or area > (img_width * img_height * 0.5):  # Add max area check
                 continue
+            
+            x, y, w, h = cv2.boundingRect(cnt)
+            ratio = w/h
+            
+            # More flexible ratio and position constraints
+            if 1.0 <= ratio <= 7.0 and y < img_height * 0.6:  # Allow taller signs
+                score = self._score_signboard_candidate(enhanced[y:y+h, x:x+w], ratio, area/(img_width*img_height))
+                candidates.append((score, (x,y,w,h)))
+
+        if candidates:
+            print(f"[Signboard] Found {len(candidates)} candidate regions")
+            # Take top 2 candidates and merge if close
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            if len(candidates) > 1:
+                box1 = candidates[0][1]
+                box2 = candidates[1][1]
+                if self._boxes_are_close(box1, box2):
+                    x = min(box1[0], box2[0])
+                    y = min(box1[1], box2[1])
+                    w = max(box1[0] + box1[2], box2[0] + box2[2]) - x
+                    h = max(box1[1] + box1[3], box2[1] + box2[3]) - y
+                    best_box = (x, y, w, h)
+                else:
+                    best_box = candidates[0][1]
+            else:
+                best_box = candidates[0][1]
+
+            x, y, w, h = best_box
+            # Add more padding
+            pad_w = int(w * 0.15)
+            pad_h = int(h * 0.25)
+            x1 = max(0, x - pad_w)
+            y1 = max(0, y - pad_h)
+            x2 = min(img_width, x + w + pad_w)
+            y2 = min(img_height, y + h + pad_h)
+            return image[y1:y2, x1:x2]
+        
+        # Improved fallback using edge density
+        if not candidates:
+            # Find region with highest edge density
+            edge_sums = np.sum(edges, axis=1) / img_width
+            mask = edge_sums > (np.max(edge_sums) * self.edge_density_threshold)
+            if np.any(mask):
+                y_start = np.argmax(mask)
+                y_end = min(y_start + self.max_signboard_height, img_height)
+                return image[y_start:y_end, :]
+            
+            # Final fallback
+            return image[0:min(200, img_height), :]
+
+    def _boxes_are_close(self, box1, box2):
+        """Check if two bounding boxes are close to each other"""
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        
+        # Calculate centers
+        c1x = x1 + w1/2
+        c1y = y1 + h1/2
+        c2x = x2 + w2/2
+        c2y = y2 + h2/2
+        
+        # Check horizontal and vertical distances
+        dx = abs(c1x - c2x) / max(w1, w2)
+        dy = abs(c1y - c2y) / max(h1, h2)
+        
+        return dx < 1.5 and dy < 0.8
+
+    def _score_signboard_candidate(self, region, aspect_ratio, area_ratio):
+        """Score a potential signboard region"""
+        score = 0.0
+        
+        # Check contrast
+        mean_val = np.mean(region)
+        std_val = np.std(region)
+        if std_val > 40:  # Good contrast
+            score += 0.3
+        
+        # Check aspect ratio (prefer 2:1 to 3:1)
+        if 2.0 <= aspect_ratio <= 3.0:
+            score += 0.3
+        
+        # Check area ratio (prefer 10-30% of image)
+        if 0.1 <= area_ratio <= 0.3:
+            score += 0.2
+        
+        # Check for text-like features
+        grad_x = cv2.Sobel(region, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(region, cv2.CV_64F, 0, 1, ksize=3)
+        if np.mean(np.abs(grad_x)) > np.mean(np.abs(grad_y)):  # Horizontal gradients
+            score += 0.2
+            
+        return score
+
+    def segment_text_regions(self, image):
+        """Robust text region segmentation using multiple methods"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Method 1: MSER with correct parameters
+        mser = cv2.MSER_create()
+        mser.setMinArea(80)
+        mser.setMaxArea(8000)
+        
+        regions, _ = mser.detectRegions(gray)
+        boxes = []
+        
+        # Filter MSER regions
+        for p in regions:
+            x, y, w, h = cv2.boundingRect(p)
+            if h >= self.min_text_height and w > h:
+                boxes.append((y, x, y+h, x+w))
+        
+        # Method 2: Morphological text detection
+        # Apply threshold
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Create horizontal kernel
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (20, 1))
+        morph = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        
+        # Find contours
+        contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Add morphological contours to boxes
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if h >= self.min_text_height and w > h:
+                boxes.append((y, x, y+h, x+w))
+        
+        # Merge and filter regions
+        if not boxes:
+            # Fallback: simple horizontal division
+            height = gray.shape[0]
+            strip_height = height // 3
+            boxes = [(i*strip_height, 0, (i+1)*strip_height, gray.shape[1]) 
+                    for i in range(3)]
+        
+        return self.merge_overlapping_regions(boxes)
+
+    def merge_overlapping_regions(self, regions):
+        """Merge overlapping text regions with improved clustering"""
+        if not regions:
+            return []
+            
+        # Convert to numpy array
+        boxes = np.array([[y1, x1, y2, x2] for y1, x1, y2, x2 in regions])
+        
+        # Cluster by vertical position with dynamic eps
+        y_centers = (boxes[:, 0] + boxes[:, 2]) / 2
+        y_range = np.max(y_centers) - np.min(y_centers)
+        eps = max(self.cluster_distance, y_range * 0.1)  # Dynamic clustering distance
+        
+        clustering = DBSCAN(eps=eps, min_samples=1).fit(y_centers.reshape(-1, 1))
+        
+        # Merge clusters
+        merged = []
+        for label in set(clustering.labels_):
+            cluster = boxes[clustering.labels_ == label]
+            # Compute cluster bounds with padding
+            y1 = max(0, np.min(cluster[:, 0]) - 5)
+            x1 = max(0, np.min(cluster[:, 1]) - 5)
+            y2 = np.max(cluster[:, 2]) + 5
+            x2 = np.max(cluster[:, 3]) + 5
+            merged.append((y1, x1, y2, x2))
+            
+        return sorted(merged, key=lambda r: r[0])
+
+    def preprocess_for_ocr(self, image):
+        print("[Preprocess] Starting image preprocessing...")
+        try:
+            if image is None or image.size == 0:
+                return []
                 
-            x,y,w,h = cv2.boundingRect(cnt)
-            aspect_ratio = w/h
+            h, w = image.shape[:2]
+            if h < 10 or w < 10:  # Skip tiny images
+                return []
+                
+            processed = []
             
-            # Check if shape is suitable for a signboard
-            if 1.2 < aspect_ratio < 6.0:  # Typical signboard ratios
-                roi = image[y:y+h, x:x+w]
-                # Check if ROI has enough contrast
-                if self.has_text_features(roi):
-                    signboards.append((x,y,w,h))
-        
-        return signboards
-
-    def has_text_features(self, roi):
-        # Convert to grayscale if not already
-        if len(roi.shape) == 3:
-            roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            # Basic preprocessing
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image.copy()
             
-        # Calculate histogram features
-        hist = cv2.calcHist([roi], [0], None, [256], [0,256])
-        hist_norm = hist.ravel()/hist.sum()
-        
-        # Check contrast and distribution
-        std_dev = np.std(roi)
-        entropy = -np.sum(hist_norm * np.log2(hist_norm + 1e-7))
-        
-        return std_dev > 30 and entropy > 3.0
-
-    def validate_text(self, text, conf):
-        if conf < self.min_confidence:
-            return False
+            # Method 1: Basic enhancement
+            enhanced = cv2.equalizeHist(gray)
+            processed.append(enhanced)
             
-        # Remove spaces for length check
-        clean_text = text.strip()
-        if len(clean_text) < self.min_text_length or len(clean_text) > self.max_text_length:
-            return False
+            # Method 2: Adaptive thresholding
+            thresh = cv2.adaptiveThreshold(gray, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 21, 10)
+            processed.append(thresh)
             
-        # Check ratio of valid characters
-        valid_chars = sum(1 for c in clean_text if c.isalnum() or c.isspace())
-        if valid_chars / len(clean_text) < self.valid_chars_ratio:
-            return False
+            print(f"[Preprocess] Created {len(processed)} image versions")
+            return processed
             
-        return True
+        except Exception as e:
+            print(f"[Preprocess] Error: {e}")
+            return [image] if image is not None else []
 
     def extract_text(self, image_path):
-        image = cv2.imread(image_path)
-        if image is None:
-            return [], None
+        print(f"\n[Extract] Processing image: {image_path}")
+        try:
+            image = cv2.imread(image_path)
+            if image is None:
+                print("[Extract] Failed to load image")
+                return ["Failed to load image"], self.get_default_image(), "shop"
+                
+            print("[Extract] Finding signboard...")
+            signboard = self.find_signboard(image)
+            print("[Extract] Segmenting text regions...")
+            text_regions = self.segment_text_regions(signboard)
+            print(f"[Extract] Found {len(text_regions)} text regions")
             
-        # Get text using EasyOCR
-        results = self.easyocr_reader.readtext(image)
-        
-        # Filter and process results
-        valid_detections = []
-        for r in results:
-            if len(r) == 3:
-                box, text, conf = r
-                if conf > 0.4:
-                    valid_detections.append((box, text, conf))
-        
-        # Use Gemini for analysis if available
-        try:
-            organized_text = self.analyze_with_gemini(image_path, ' '.join(t[1] for t in valid_detections))
-        except Exception as e:
-            print(f"Gemini analysis failed: {e}")
-            organized_text = self.basic_organize_text([t[1] for t in valid_detections])
-        
-        # Create visualization
-        visualized = self.draw_results(image, valid_detections)
-        
-        return [organized_text], visualized
+            all_texts = []
+            for idx, (y1, x1, y2, x2) in enumerate(text_regions):
+                print(f"\n[Extract] Processing region {idx+1}/{len(text_regions)}")
+                region = signboard[int(y1):int(y2), int(x1):int(x2)]
+                if region.size == 0:
+                    print("[Extract] Empty region, skipping")
+                    continue
+                
+                results, _ = self.process_region(region)
+                if results:
+                    texts = [r[0] for r in results]
+                    print(f"[Extract] Region {idx+1} texts: {texts}")
+                    all_texts.extend(texts)
 
-    def get_easyocr_text(self, image):
-        try:
-            results = self.easyocr_reader.readtext(image)
-            return [(r[0], r[1], r[2]) for r in results if r[2] > 0.4]
+            if not all_texts:
+                print("[Extract] No text detected in any region")
+                return ["No text detected"], Image.fromarray(cv2.cvtColor(signboard, cv2.COLOR_BGR2RGB)), "shop"
+
+            final_text = self.structure_text(' '.join(all_texts))
+            print(f"[Extract] Final structured text: {final_text}")
+            business_type = self.get_business_type(final_text)
+            print(f"[Extract] Detected business type: {business_type}")
+            
+            return [final_text], Image.fromarray(cv2.cvtColor(signboard, cv2.COLOR_BGR2RGB)), business_type
+            
         except Exception as e:
-            print(f"EasyOCR error: {e}")
+            print(f"[Extract] Error: {e}")
+            return ["Error processing image"], self.get_default_image(), "shop"
+
+    def get_default_image(self):
+        """Create a default blank image for error cases"""
+        blank = np.ones((100, 300, 3), dtype=np.uint8) * 255
+        cv2.putText(blank, "No image available", (50, 50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        return Image.fromarray(blank)
+
+    def segment_signboard(self, image):
+        """Simplified signboard segmentation"""
+        print("[Segment] Starting advanced segmentation")
+        try:
+            if image is None or image.size == 0:
+                return []
+                
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            
+            # Simple adaptive thresholding
+            binary = cv2.adaptiveThreshold(gray, 255, 
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                cv2.THRESH_BINARY_INV, 25, 15)
+            
+            # Find contours
+            contours, _ = cv2.findContours(binary, 
+                cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            segments = []
+            img_h, img_w = image.shape[:2]
+            min_area = img_w * img_h * 0.01
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if min_area < area < self.segment_params['max_area']:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    ratio = w / float(h)
+                    if (self.segment_params['min_ratio'] < ratio < 
+                        self.segment_params['max_ratio']):
+                        segments.append((x, y, w, h))
+            
+            print(f"[Segment] Found {len(segments)} valid segments")
+            return segments
+            
+        except Exception as e:
+            print(f"[Segment] Error: {e}")
             return []
 
-    def get_tesseract_text(self, image):
+    def process_region(self, region):
+        """Enhanced region processing with better error handling"""
+        print("\n[Process] Processing region")
         try:
-            # Preprocess for Tesseract
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            if region is None or region.size == 0:
+                return [], region
+
+            results = []
+            h, w = region.shape[:2]
             
-            # Get text
-            text = pytesseract.image_to_string(thresh)
-            return text.strip()
+            # Process whole region first
+            processed = self.preprocess_for_ocr(region)
+            for img in processed:
+                try:
+                    detections = self.easyocr_reader.readtext(img, **self.ocr_params)
+                    for box, text, conf in detections:
+                        if text.strip() and conf > self.easyocr_conf:
+                            # Convert box to numpy array properly
+                            box_arr = np.array(box, dtype=np.int32)
+                            results.append((text.strip(), conf, box_arr))
+                except Exception as e:
+                    print(f"[Process] Detection error: {e}")
+                    continue
+
+            # Cluster results by lines
+            if results:
+                results = self.cluster_text_by_position(results)
+
+            return results, region
+
         except Exception as e:
-            print(f"Tesseract error: {e}")
-            return ""
+            print(f"[Process] Critical error: {e}")
+            return [], region
 
-    def merge_ocr_results(self, easy_results, tess_results):
-        merged_text = []
-        
-        # Add EasyOCR results
-        for box, text, conf in easy_results:
-            if text.strip():
-                merged_text.append(text.strip())
-        
-        # Add Tesseract results
-        if tess_results:
-            merged_text.extend([t for t in tess_results.split('\n') if t.strip()])
-        
-        return ' '.join(merged_text)
+    def cluster_text_by_position(self, results):
+        """Cluster text by vertical position with NumPy 2.0 compatibility"""
+        if not results:
+            return []
 
-    def analyze_with_gemini(self, image_path, text):
         try:
-            # Prepare image for Gemini
-            image = cv2.imread(image_path)
-            _, encoded_img = cv2.imencode('.jpg', image)
-            image_bytes = encoded_img.tobytes()
+            # Sort by vertical position
+            results = sorted(results, key=lambda x: np.mean(x[2][:, 1]))
             
-            # Create prompt
-            prompt = f"""
-            Analyze this shop signboard image and extracted text: {text}
+            # Group by vertical proximity
+            lines = []
+            current_line = [results[0]]
+            mean_height = np.mean([np.max(r[2][:, 1]) - np.min(r[2][:, 1]) for r in results])
             
-            1. Identify the business name
-            2. Identify products/services offered
-            3. Extract contact information
-            4. Extract location details if any
+            for res in results[1:]:
+                curr_y = np.mean(current_line[-1][2][:, 1])
+                next_y = np.mean(res[2][:, 1])
+                
+                if abs(next_y - curr_y) <= mean_height * 0.5:
+                    current_line.append(res)
+                else:
+                    # Sort line by horizontal position
+                    current_line.sort(key=lambda x: np.min(x[2][:, 0]))
+                    lines.extend(current_line)
+                    current_line = [res]
             
-            Format the response as:
-            Business Name: [name]
-            Products/Services: [list]
-            Contact: [details]
-            Location: [address]
-            """
+            # Add last line
+            if current_line:
+                current_line.sort(key=lambda x: np.min(x[2][:, 0]))
+                lines.extend(current_line)
+
+            return lines
             
-            # Get Gemini response
-            response = self.model.generate_content([prompt, image_bytes])
-            
-            return response.text
         except Exception as e:
-            print(f"Gemini error: {e}")
-            # Fallback to basic organization
-            return self.basic_organize_text(text)
+            print(f"[Cluster] Error: {e}")
+            return results
 
-    def basic_organize_text(self, text_list):
-        # Basic fallback organization if Gemini fails
-        text_info = {
-            'business_name': [],
-            'products': [],
-            'contact': [],
-            'address': [],
-            'other': []
-        }
-        
-        # Handle input whether it's a string or list
-        if isinstance(text_list, str):
-            text_list = [text_list]
-        
-        for text in text_list:
-            cleaned_text = str(text).strip()
-            if any(char.isdigit() for char in cleaned_text):
-                if len(cleaned_text) > 8:  # Likely phone/mobile
-                    text_info['contact'].append(cleaned_text)
-                else:
-                    text_info['other'].append(cleaned_text)
-            elif any(word in cleaned_text.lower() for word in ['road', 'street', 'lane', 'nagar']):
-                text_info['address'].append(cleaned_text)
-            elif any(word in cleaned_text.lower() for word in ['shop', 'store', 'traders', 'collection']):
-                text_info['business_name'].append(cleaned_text)
-            elif any(word in cleaned_text.lower() for word in ['stationary', 'gift', 'general', 'mobile', 'services']):
-                text_info['products'].append(cleaned_text)
-            else:
-                text_info['other'].append(cleaned_text)
-        
-        # Format organized text
-        formatted_text = []
-        for category, texts in text_info.items():
-            if texts:
-                if category == 'business_name':
-                    formatted_text.insert(0, f"Business Name: {' '.join(texts)}")
-                elif category == 'products':
-                    formatted_text.append(f"Products/Services: {', '.join(texts)}")
-                elif category == 'contact':
-                    formatted_text.append(f"Contact: {', '.join(texts)}")
-                elif category == 'address':
-                    formatted_text.append(f"Address: {' '.join(texts)}")
-        
-        return '\n'.join(formatted_text) if formatted_text else "No structured information found"
-
-    def draw_results(self, image, text_groups):
-        output = image.copy()
-        overlay = image.copy()
-        
-        # Handle case where text_groups contains detection tuples
-        if text_groups and isinstance(text_groups[0], tuple):
-            # Draw OCR boxes and text
-            for box, text, conf in text_groups:
-                points = np.array(box).astype(np.int32)
-                # Draw filled polygon for text region
-                cv2.fillPoly(overlay, [points], (0, 255, 0, 0.3))
-                # Draw text boundary
-                cv2.polylines(output, [points], True, (0, 255, 0), 2)
-                # Add text and confidence
-                cv2.putText(output, f"{text}", 
-                           tuple(points[0]), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 
-                           0.7, (0, 0, 255), 2)
-        else:
-            # Handle case where text_groups contains strings
-            y_offset = 30
-            for text in text_groups:
-                if isinstance(text, (list, tuple)):
-                    text = ' '.join(str(t) for t in text)
-                else:
-                    text = str(text)
-                    
-                cv2.putText(output, text,
-                           (10, y_offset),
-                           cv2.FONT_HERSHEY_SIMPLEX,
-                           0.7, (0, 255, 0), 2)
-                y_offset += 30
-        
-        # Blend overlay with original
-        alpha = 0.3
-        output = cv2.addWeighted(overlay, alpha, output, 1 - alpha, 0)
-        
-        return output
-
-    def clean_text(self, text):
-        # Remove unwanted characters
-        text = ''.join(c if c.isalnum() or c.isspace() or c in '&,-' else ' ' for c in text)
-        # Remove multiple spaces
-        text = ' '.join(text.split())
-        return text.strip()
-
-    def find_common_word(self, text):
-        if not text:
-            return None
+    def enhance_bakery_results(self, results):
+        """Enhance bakery-specific detections with NumPy 2.0 compatibility"""
+        if not results:
+            return results
             
-        # Handle list input
-        if isinstance(text, list):
-            text = ' '.join(str(item) for item in text)
-        
-        # Normalize and split text
+        enhanced = []
         try:
-            words = text.lower().strip().split()
-        except AttributeError:
-            print(f"Error processing text: {text}")
-            return None
-        
-        # Business-related keywords to prioritize
-        business_words = {
-            'traders', 'store', 'shop', 'stores', 'mobile', 'general', 
-            'electronics', 'services', 'stationar', 'gift', 'collection'
-        }
-        
-        # Enhanced stop words list
-        stop_words = {
-            'the', 'and', 'for', 'ltd', 'limited', 'pvt', 'private',
-            'cell', 'ph', 'phone', 'mob', 'etc', 'brand', 'well'
-        }
-        
-        # Filter words
-        words = [
-            word for word in words 
-            if (len(word) > 2 and 
-                word not in stop_words and 
-                not word.isdigit() and
-                not any(char.isdigit() for char in word))
-        ]
-        
-        if not words:
-            return None
-        
-        # Prioritize business-related words
-        business_related = [word for word in words if word in business_words]
-        if business_related:
-            # Get most frequent business word
-            word_counts = Counter(business_related)
-            return max(word_counts.items(), key=lambda x: (x[1], len(x[0])))[0]
-        
-        # If no business words found, use most frequent word
-        word_counts = Counter(words)
-        return max(word_counts.items(), key=lambda x: (x[1], len(x[0])))[0]
-
-    def organize_text(self, detections):
-        # Organize text into categories
-        text_info = {
-            'business_name': [],
-            'products': [],
-            'contact': [],
-            'address': [],
-            'other': []
-        }
-        
-        for text in detections:
-            cleaned_text = str(text).strip()
-            if any(char.isdigit() for char in cleaned_text):
-                if len(cleaned_text) > 8:  # Likely phone/mobile
-                    text_info['contact'].append(cleaned_text)
-                else:
-                    text_info['other'].append(cleaned_text)
-            elif any(word in cleaned_text.lower() for word in ['road', 'street', 'lane', 'nagar']):
-                text_info['address'].append(cleaned_text)
-            elif any(word in cleaned_text.lower() for word in ['shop', 'store', 'traders', 'collection']):
-                text_info['business_name'].append(cleaned_text)
-            elif any(word in cleaned_text.lower() for word in ['stationary', 'gift', 'general', 'mobile', 'services']):
-                text_info['products'].append(cleaned_text)
-            else:
-                text_info['other'].append(cleaned_text)
-        
-        # Format organized text
-        formatted_text = []
-        for category, texts in text_info.items():
-            if texts:
-                if category == 'business_name':
-                    formatted_text.insert(0, f"Business Name: {' '.join(texts)}")
-                elif category == 'products':
-                    formatted_text.append(f"Products/Services: {', '.join(texts)}")
-                elif category == 'contact':
-                    formatted_text.append(f"Contact: {', '.join(texts)}")
-                elif category == 'address':
-                    formatted_text.append(f"Address: {' '.join(texts)}")
-        
-        return '\n'.join(formatted_text)
-
-    def extract_text(self, image_path):
-        image = cv2.imread(image_path)
-        if image is None:
-            return [], None
+            # Calculate mean height using numpy operations
+            heights = [np.max(r[2][:, 1]) - np.min(r[2][:, 1]) for r in results]
+            mean_height = np.mean(heights) if heights else 0
             
-        # Get text using EasyOCR
-        results = self.easyocr_reader.readtext(image)
-        
-        # Filter and process results
-        valid_detections = []
-        for r in results:
-            if len(r) == 3:
-                box, text, conf = r
-                if conf > 0.4:
-                    valid_detections.append((box, text, conf))
-        
-        # Use Gemini for analysis if available
-        try:
-            organized_text = self.analyze_with_gemini(image_path, ' '.join(t[1] for t in valid_detections))
+            for text, conf, box in results:
+                # Check for bakery-specific patterns
+                for pattern in self.bakery_params['name_patterns']:
+                    if re.search(pattern, text):
+                        conf *= 1.3
+                
+                # Get text height
+                height = np.max(box[:, 1]) - np.min(box[:, 1])
+                
+                # Apply size-based boost
+                if height > mean_height * 1.2:
+                    conf *= self.bakery_params['layout_weights']['large_text']
+                
+                enhanced.append((text, conf, box))
+            
+            return sorted(enhanced, key=lambda x: -x[1])
+            
         except Exception as e:
-            print(f"Gemini analysis failed: {e}")
-            organized_text = self.basic_organize_text([t[1] for t in valid_detections])
+            print(f"[Enhance] Error: {e}")
+            return results
+
+    def clean_detected_text(self, text):
+        print(f"[Clean] Input text: {text}")
+        cleaned = re.sub(r'[^a-zA-Z0-9\s&-]', '', text)
+        cleaned = ' '.join(cleaned.split())
+        print(f"[Clean] Cleaned text: {cleaned}")
+        return cleaned
+
+    def filter_duplicate_detections(self, results):
+        """Remove duplicate detections keeping highest confidence"""
+        if not results:
+            return []
+            
+        # Group by similar text
+        text_groups = {}
+        for text, conf, box in results:
+            text_lower = text.lower()
+            if text_lower not in text_groups or conf > text_groups[text_lower][1]:
+                text_groups[text_lower] = (text, conf, box)
         
-        # Create visualization
-        visualized = self.draw_results(image, valid_detections)
+        # Sort by confidence
+        return sorted(text_groups.values(), key=lambda x: -x[1])
+
+    def draw_detection(self, image, box, text, conf):
+        """Draw detection with improved visibility"""
+        cv2.polylines(image, [box], True, self.box_color, 2)
         
-        return [organized_text], visualized
+        # Add background for better text visibility
+        x, y = box[0]
+        y = max(30, y - 10)
+        cv2.rectangle(image, (x, y-20), (x+len(text)*10, y), (255,255,255), -1)
+        
+        # Draw text and confidence
+        cv2.putText(image, f"{text} ({conf:.2f})", 
+                   (x, y-5), self.font, 0.5, (0,0,0), 2)
+
+    def sort_results(self, results):
+        """Safely sort OCR results"""
+        if not results:
+            return []
+            
+        def get_x(result):
+            try:
+                box = result[2]
+                if box is not None and isinstance(box, np.ndarray):
+                    return box[0][0]  # Get leftmost x-coordinate
+                return float('inf')  # Put results without valid boxes at the end
+            except:
+                return float('inf')
+        
+        return sorted(results, key=get_x)
+
+    def is_valid_text(self, text):
+        """Improved text validation"""
+        text = text.strip()
+        if not text or len(text) < 2:
+            return False
+            
+        # Must contain letters
+        if not any(c.isalpha() for c in text):
+            return False
+            
+        # Remove common noise
+        text = re.sub(r'[^\w\s]', '', text)
+        
+        # Check valid character ratio
+        valid_chars = sum(1 for c in text if c.isalnum() or c.isspace())
+        return valid_chars / len(text) > 0.5
+
+    def clean_text(self, text_lines):
+        # Basic text cleaning
+        cleaned = []
+        seen = set()
+
+        for line in text_lines:
+            # Remove noise and normalize
+            line = re.sub(r'[^A-Za-z0-9\s&.]', '', line)
+            line = ' '.join(line.split())
+            
+            if line and line.lower() not in seen:
+                cleaned.append(line)
+                seen.add(line.lower())
+        
+        # Find most likely shop name
+        for line in cleaned:
+            words = line.split()
+            if len(words) >= 2 and any(w.lower() in self.business_words for w in words):
+                return line.title()
+        
+        return cleaned[0] if cleaned else "Unknown Shop"
+
+    def get_business_type(self, text):
+        print(f"[Business Type] Analyzing text: {text}")
+        text_lower = text.lower()
+        max_score = 0
+        best_type = "shop"  # Default fallback
+        
+        # Score each business category
+        for category, base_score in self.business_categories.items():
+            if category in text_lower:
+                score = base_score
+                # Boost score if it appears multiple times or in specific contexts
+                if f"{category}s" in text_lower:  # Plural form
+                    score += 1
+                if any(word in text_lower for word in ["new", "sri", "shree", "the"]):
+                    score += 1
+                
+                if score > max_score:
+                    max_score = score
+                    best_type = category
+        
+        print(f"[Business Type] Detected type: {best_type} with score: {max_score}")
+        return best_type
+
+    def structure_text(self, text):
+        """Structure and format detected text"""
+        print(f"[Structure] Input text: {text}")
+        try:
+            # Remove unwanted characters and normalize spaces
+            text = self.clean_detected_text(text)
+            words = text.split()
+            
+            # Filter out ignored words and short words
+            words = [w for w in words if len(w) >= self.min_word_length 
+                    and w.lower() not in self.ignored_words]
+            
+            # Apply word corrections
+            words = [self.word_corrections.get(w.upper(), w) for w in words]
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            words = [w for w in words if not (w.lower() in seen or seen.add(w.lower()))]
+            
+            # Limit word repeats
+            word_counts = Counter(w.lower() for w in words)
+            words = [w for w in words 
+                    if word_counts[w.lower()] <= self.max_word_repeats]
+            
+            final_text = ' '.join(words).strip()
+            print(f"[Structure] Structured text: {final_text}")
+            return final_text if final_text else "Unknown"
+            
+        except Exception as e:
+            print(f"[Structure] Error: {e}")
+            return "Unknown"
