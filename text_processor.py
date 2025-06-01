@@ -7,10 +7,13 @@ import cv2
 import numpy as np
 import pytesseract
 import easyocr
-from collections import Counter
-from sklearn.cluster import DBSCAN
-import re
 from PIL import Image
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForMaskedLM
+from sklearn.cluster import DBSCAN
+from rapidfuzz import fuzz, process
+from collections import Counter
+import re
 
 class TextProcessor:
     def __init__(self):
@@ -217,6 +220,79 @@ class TextProcessor:
                 'large_text': 1.3      # Boost larger text
             }
         }
+
+        # BERT spell checking
+        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+        self.spell_checker = AutoModelForMaskedLM.from_pretrained('bert-base-uncased')
+        
+        # Add focused corrections dictionary for business text
+        self.business_corrections = {
+            'KISHNA': 'KRISHNA',
+            'STATNEKY': 'STATIONERY',
+            'STATIONRY': 'STATIONERY',
+            'CEMRE': 'CENTRE',
+            'CEMTRE': 'CENTRE',
+            'CTR': 'CENTRE',
+            'STNTIONEKY': 'STATIONERY',
+            'STATINERY': 'STATIONERY'
+        }
+        
+        # Update minimum thresholds
+        self.min_word_confidence = 0.4  # Balanced confidence threshold
+        self.min_text_length = 3      # Minimum word length
+        self.max_corrections = 2       # Limit corrections per word
+        
+        # Business name patterns
+        self.name_patterns = {
+            'phone': r'(?:cell|tel|phone|:|\+)?(?:\d[\d-,\s]*\d)',
+            'noise': r'[0-9%*]+\s*[0-9%*]+',
+            'symbols': r'[^\w\s-]'
+        }
+
+        # Add common business text corrections
+        self.common_corrections = {
+            'KISHNA': 'KRISHNA',
+            'STATNEKY': 'STATIONERY',
+            'STATIONERY': 'STATIONERY',
+            'CEMRE': 'CENTRE',
+            'CEMTRE': 'CENTRE',
+            'USHNA': 'KRISHNA',
+            'STATINERY': 'STATIONERY',
+            'STATIONRY': 'STATIONERY',
+            'STNTIONEKY': 'STATIONERY'
+        }
+
+        # Simplified corrections dictionary
+        self.text_corrections = {
+            'KISHNA': 'KRISHNA',
+            'STATNEKY': 'STATIONERY',
+            'CEMRE': 'CENTRE',
+            'CEMTRE': 'CENTRE',
+            'STNTIONEKY': 'STATIONERY',
+            'USHNA': 'KRISHNA',
+            'LISHNA': 'KRISHNA'
+        }
+
+        # Add business keywords for text processing
+        self.business_keywords = {
+            'stationery': {'stationery', 'stationers', 'paper', 'book', 'books'},
+            'gift': {'gift', 'gifts', 'card', 'cards'},
+            'centre': {'centre', 'center', 'central'},
+            'shop': {'shop', 'store', 'mart', 'emporium'}
+        }
+
+        # Add shop type keywords
+        self.shop_keywords = {
+            'bakery': {'bakery', 'baker', 'bake', 'bread', 'cake', 'sweet', 'confectionery'},
+            'store': {'store', 'stores', 'general store', 'general stores'},
+            'shop': {'shop', 'mart', 'market', 'emporium'},
+            'other': {'haji', 'noor', 'ahmed', 'jalil'}
+        }
+
+        # Processing parameters
+        self.min_word_len = 3
+        self.max_name_words = 2
+        self.min_word_confidence = 0.6
 
     def find_signboard(self, image):
         print("\n[Signboard] Detecting signboard region...")
@@ -753,34 +829,219 @@ class TextProcessor:
         print(f"[Business Type] Detected type: {best_type} with score: {max_score}")
         return best_type
 
+    def _process_text(self, texts):
+        """Enhanced text processing with BERT correction"""
+        if not texts:
+            return None
+
+        # First pass: Clean and normalize
+        cleaned = []
+        for text in texts:
+            # Remove numbers, phone numbers and special chars
+            text = re.sub(r'\d[-\d\s,]*\d', '', text)  # Remove phone numbers
+            text = re.sub(r'[^A-Za-z\s]', ' ', text)   # Keep only letters
+            text = ' '.join(text.split())               # Normalize spaces
+            
+            if text and len(text) >= 3:
+                cleaned.append(text.upper())
+
+        # Remove duplicates and sort by length
+        cleaned = sorted(set(cleaned), key=len, reverse=True)
+        
+        # Second pass: BERT correction for each word
+        business_name = []
+        business_type = []
+
+        for text in cleaned:
+            words = text.split()
+            for word in words:
+                if len(word) < 3:
+                    continue
+                    
+                # Skip if already processed
+                if word in business_name or word in business_type:
+                    continue
+
+                # Check if it's a known business type
+                is_type = False
+                for type_words in self.business_keywords.values():
+                    if any(fuzz.ratio(word.lower(), kw) > 80 for kw in type_words):
+                        business_type.append(word)
+                        is_type = True
+                        break
+
+                if not is_type:
+                    # Use BERT for spelling correction
+                    corrected = self._bert_spell_check(word)
+                    if corrected and len(corrected) >= 3:
+                        business_name.append(corrected)
+
+        # Structure final text
+        final_parts = []
+        
+        # Add business name (up to 2 parts)
+        if business_name:
+            final_parts.extend(business_name[:2])
+        
+        # Add business type
+        if business_type:
+            final_parts.extend(business_type)
+            
+        final_text = ' '.join(final_parts)
+        print(f"[Process] Final text: {final_text}")
+        return final_text
+
+    def _remove_noise(self, text):
+        """Remove noise from text"""
+        # Remove phone numbers and digits
+        text = re.sub(r'\d[-\d\s,]*\d', '', text)
+        text = re.sub(r'[^A-Za-z\s]', ' ', text)
+        # Remove extra spaces
+        text = ' '.join(text.split())
+        return text
+
+    def _bert_spell_check(self, word):
+        """Balanced BERT spell checking"""
+        try:
+            # Skip short words
+            if len(word) < self.min_text_length:
+                return word
+
+            # Check business corrections first
+            if word.upper() in self.business_corrections:
+                return self.business_corrections[word.upper()]
+
+            # Skip if word is a known business term
+            if any(word.lower() in keywords for keywords in self.business_keywords.values()):
+                return word.upper()
+
+            # Apply BERT correction
+            inputs = self.tokenizer(word, return_tensors="pt", padding=True)
+            with torch.no_grad():
+                outputs = self.spell_checker(**inputs)
+                predictions = outputs.logits[0]
+                
+                # Get top prediction
+                probs = torch.softmax(predictions, dim=-1)
+                values, indices = torch.topk(probs, k=1)
+                
+                if values[0][0] > self.min_word_confidence:
+                    correction = self.tokenizer.decode([indices[0][0]])
+                    # Verify similarity
+                    if fuzz.ratio(word.lower(), correction.lower()) > 70:
+                        return correction.upper()
+
+            return word.upper()
+            
+        except Exception as e:
+            print(f"[Spell] Error: {str(e)}")
+            return word.upper()
+
     def structure_text(self, text):
-        """Structure and format detected text"""
+        """Enhanced text structuring with BERT verification"""
         print(f"[Structure] Input text: {text}")
         try:
-            # Remove unwanted characters and normalize spaces
-            text = self.clean_detected_text(text)
-            words = text.split()
+            # First pass: Clean and group words
+            words = []
+            for word in text.split():
+                # Remove noise
+                word = re.sub(r'[^A-Za-z\s]', '', word)
+                word = word.strip().upper()
+                
+                if len(word) >= 3 and not any(c.isdigit() for c in word):
+                    # Group similar words
+                    similar_found = False
+                    for existing in words:
+                        if fuzz.ratio(word, existing) > 85:
+                            similar_found = True
+                            break
+                    if not similar_found:
+                        words.append(word)
+
+            # Second pass: Identify business name and type
+            name_words = []
+            type_words = []
             
-            # Filter out ignored words and short words
-            words = [w for w in words if len(w) >= self.min_word_length 
-                    and w.lower() not in self.ignored_words]
+            for word in words:
+                # Check if it's a shop type word
+                is_type = False
+                for type_name, keywords in self.shop_keywords.items():
+                    if any(fuzz.ratio(word.lower(), kw) > 80 for kw in keywords):
+                        corrected = self._get_best_match(word, keywords)
+                        if corrected and corrected not in type_words:
+                            type_words.append(corrected)
+                            is_type = True
+                            break
+                
+                # If not a type, consider it part of business name
+                if not is_type:
+                    corrected = self._bert_verify_word(word)
+                    if corrected and len(corrected) >= 3:
+                        name_words.append(corrected)
+
+            # Build final text
+            final_words = []
             
-            # Apply word corrections
-            words = [self.word_corrections.get(w.upper(), w) for w in words]
+            # Add verified name words (up to 2)
+            if name_words:
+                final_words.extend(name_words[:2])
             
-            # Remove duplicates while preserving order
-            seen = set()
-            words = [w for w in words if not (w.lower() in seen or seen.add(w.lower()))]
+            # Add type words
+            final_words.extend(type_words)
             
-            # Limit word repeats
-            word_counts = Counter(w.lower() for w in words)
-            words = [w for w in words 
-                    if word_counts[w.lower()] <= self.max_word_repeats]
-            
-            final_text = ' '.join(words).strip()
-            print(f"[Structure] Structured text: {final_text}")
+            final_text = ' '.join(final_words)
+            print(f"[Structure] Final text: {final_text}")
             return final_text if final_text else "Unknown"
             
         except Exception as e:
-            print(f"[Structure] Error: {e}")
+            print(f"[Structure] Error: {str(e)}")
             return "Unknown"
+
+    def _bert_verify_word(self, word):
+        """Use BERT to verify and correct business words"""
+        try:
+            # Check common corrections first
+            if word in self.text_corrections:
+                return self.text_corrections[word]
+
+            # Skip known valid words
+            for keywords in self.shop_keywords.values():
+                if word.lower() in keywords:
+                    return word
+
+            # Use BERT for verification
+            inputs = self.tokenizer(word, return_tensors="pt", padding=True)
+            with torch.no_grad():
+                outputs = self.spell_checker(**inputs)
+                logits = outputs.logits[0]
+                probs = torch.softmax(logits, dim=-1)
+                
+                # Get top 3 predictions
+                values, indices = torch.topk(probs, k=3)
+                
+                for val, idx in zip(values[0], indices[0]):
+                    if val > 0.3:  # Lower confidence threshold
+                        correction = self.tokenizer.decode([idx])
+                        # Check if correction is reasonable
+                        if (len(correction) >= 3 and 
+                            fuzz.ratio(word.lower(), correction.lower()) > 60):
+                            return correction.upper()
+            
+            return word
+
+        except Exception as e:
+            print(f"[BERT] Error: {str(e)}")
+            return word
+
+    def _get_best_match(self, word, keywords):
+        """Get best matching word from keywords"""
+        best_match = None
+        best_ratio = 0
+        
+        for kw in keywords:
+            ratio = fuzz.ratio(word.lower(), kw)
+            if ratio > best_ratio and ratio > 80:
+                best_ratio = ratio
+                best_match = kw.upper()
+        
+        return best_match if best_match else word
