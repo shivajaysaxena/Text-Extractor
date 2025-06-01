@@ -3,8 +3,17 @@ import os
 from PIL import Image
 from database import ImageDatabase
 from text_processor import TextProcessor
+from text_processor_llm import TextProcessorLLM
 import shutil
 import hashlib
+import asyncio
+
+# Initialize processors
+@st.cache_resource
+def get_processors():
+    local_processor = TextProcessor()
+    llm_processor = TextProcessorLLM(api_key=st.secrets["GEMINI_API_KEY"])
+    return local_processor, llm_processor
 
 def get_image_hash(image_path):
     with open(image_path, "rb") as f:
@@ -20,6 +29,10 @@ def save_uploaded_file(uploaded_file):
         f.write(uploaded_file.getbuffer())
     return file_path
 
+async def process_with_llm(processor, temp_path):
+    """Helper function to process with LLM"""
+    return await processor.extract_text(temp_path)
+
 def upload_page(db, processor):
     st.header("Upload and Extract Text")
     uploaded_file = st.file_uploader("Choose an image", type=["jpg", "jpeg", "png"])
@@ -31,8 +44,13 @@ def upload_page(db, processor):
         if st.button("Extract Text"):
             temp_path = save_uploaded_file(uploaded_file)
             
-            # Extract text and get visualization with common phrase
-            shops_text, visualized, common_phrase = processor.extract_text(temp_path)
+            # Handle both sync and async processors
+            if isinstance(processor, TextProcessorLLM):
+                # Use sync wrapper
+                shops_text, visualized, common_phrase = processor.extract_text_sync(temp_path)
+            else:
+                # Use sync processor
+                shops_text, visualized, common_phrase = processor.extract_text(temp_path)
             
             # Display extracted text for each shop
             st.subheader("Extracted Text:")
@@ -85,7 +103,17 @@ def main():
     st.title("Image Text Extractor and Organizer")
     
     db = ImageDatabase()
-    processor = TextProcessor()
+    local_processor, llm_processor = get_processors()
+    
+    # Model selection
+    model_type = st.radio(
+        "Select Processing Model",
+        ["Local Model", "LLM Model (Gemini)"],
+        help="Choose between local processing or cloud LLM"
+    )
+    
+    # Set processor based on selection
+    processor = local_processor if model_type == "Local Model" else llm_processor
     
     # Add sidebar navigation
     st.sidebar.title("Navigation")
