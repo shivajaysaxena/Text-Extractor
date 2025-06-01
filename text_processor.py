@@ -281,18 +281,31 @@ class TextProcessor:
             'shop': {'shop', 'store', 'mart', 'emporium'}
         }
 
-        # Add shop type keywords
-        self.shop_keywords = {
-            'bakery': {'bakery', 'baker', 'bake', 'bread', 'cake', 'sweet', 'confectionery'},
-            'store': {'store', 'stores', 'general store', 'general stores'},
-            'shop': {'shop', 'mart', 'market', 'emporium'},
-            'other': {'haji', 'noor', 'ahmed', 'jalil'}
+        # Common name variations
+        self.name_corrections = {
+            'EHAGAWAN': 'BHAGAWAN',
+            'BAGWAN': 'BHAGWAN',
+            'BAGAWAN': 'BHAGWAN',
+            'MOB': None,  # Ignore mobile-related prefixes
+            'MOBL': None,
+            'CELL': None,
+            'TEL': None
         }
 
-        # Processing parameters
-        self.min_word_len = 3
-        self.max_name_words = 2
-        self.min_word_confidence = 0.6
+        # Update shop keywords with more variations
+        self.shop_keywords = {
+            'bakery': {'bakery', 'baker', 'bake', 'bread', 'cake', 'sweet', 'confectionery'},
+            'store': {'store', 'stores', 'general store', 'general stores', 'provision'},
+            'shop': {'shop', 'mart', 'market', 'emporium', 'centre', 'center'},
+            'names': {'bhagwan', 'bhagawan', 'shree', 'sri', 'shri', 'krishna', 'ram', 'noor'}
+        }
+
+        # Add name patterns
+        self.name_patterns = {
+            'prefixes': {'shri', 'shree', 'sri', 'new', 'the'},
+            'suffixes': {'mart', 'store', 'shop', 'traders', 'center', 'centre'},
+            'common': {'bhagwan', 'bhagawan', 'krishna', 'ram', 'noor', 'ahmed', 'haji'}
+        }
 
     def find_signboard(self, image):
         print("\n[Signboard] Detecting signboard region...")
