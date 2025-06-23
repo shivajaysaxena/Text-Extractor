@@ -65,17 +65,17 @@ def upload_page(db, processor):
                             db.save_image_data(temp_path, shop_text, common_phrase, image_hash)
             
             # Show OCR visualization
-            st.subheader("Text Detection Visualization")
-            st.image(visualized, caption="Detected Text", use_column_width=True)
+            # st.subheader("Text Detection Visualization")
+            # st.image(visualized, caption="Detected Text", use_column_width=True)
             
-            # Add download button for OCR visualization
-            with open('temp_ocr_vis.jpg', 'rb') as file:
-                btn = st.download_button(
-                    label="Download OCR Visualization",
-                    data=file,
-                    file_name="ocr_visualization.jpg",
-                    mime="image/jpeg"
-                )
+            # # Add download button for OCR visualization
+            # with open('temp_ocr_vis.jpg', 'rb') as file:
+            #     btn = st.download_button(
+            #         label="Download OCR Visualization",
+            #         data=file,
+            #         file_name="ocr_visualization.jpg",
+            #         mime="image/jpeg"
+            #     )
 
 def search_page(db):
     st.header("Search Images by Common Word")
