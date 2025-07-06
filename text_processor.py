@@ -531,6 +531,22 @@ class TextProcessor:
                 cv2.THRESH_BINARY, 21, 10)
             processed.append(thresh)
             
+            # Method 3: Otsu thresholding
+            _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            processed.append(otsu)
+            
+            # Method 4: CLAHE + adaptive threshold
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            clahe_img = clahe.apply(gray)
+            clahe_thresh = cv2.adaptiveThreshold(clahe_img, 255,
+                cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 8)
+            processed.append(clahe_thresh)
+            
+            # Method 5: Morphological closing
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            morph = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
+            processed.append(morph)
+
             print(f"[Preprocess] Created {len(processed)} image versions")
             return processed
             
@@ -545,38 +561,34 @@ class TextProcessor:
             if image is None:
                 print("[Extract] Failed to load image")
                 return ["Failed to load image"], self.get_default_image(), "shop"
-                
-            print("[Extract] Finding signboard...")
-            signboard = self.find_signboard(image)
-            print("[Extract] Segmenting text regions...")
-            text_regions = self.segment_text_regions(signboard)
-            print(f"[Extract] Found {len(text_regions)} text regions")
-            
+
+            # --- Analyze the whole board, not just detected signboard ---
+            processed_imgs = self.preprocess_for_ocr(image)
             all_texts = []
-            for idx, (y1, x1, y2, x2) in enumerate(text_regions):
-                print(f"\n[Extract] Processing region {idx+1}/{len(text_regions)}")
-                region = signboard[int(y1):int(y2), int(x1):int(x2)]
-                if region.size == 0:
-                    print("[Extract] Empty region, skipping")
+            all_confs = []
+            for img in processed_imgs:
+                try:
+                    detections = self.easyocr_reader.readtext(img, **self.ocr_params)
+                    for _, text, conf in detections:
+                        if text.strip() and conf > self.easyocr_conf:
+                            all_texts.append(text.strip())
+                            all_confs.append(conf)
+                except Exception as e:
+                    print(f"[Process] Detection error: {e}")
                     continue
-                
-                results, _ = self.process_region(region)
-                if results:
-                    texts = [r[0] for r in results]
-                    print(f"[Extract] Region {idx+1} texts: {texts}")
-                    all_texts.extend(texts)
 
             if not all_texts:
                 print("[Extract] No text detected in any region")
-                return ["No text detected"], Image.fromarray(cv2.cvtColor(signboard, cv2.COLOR_BGR2RGB)), "shop"
+                return ["No text detected"], Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)), "shop"
 
+            # Use BERT correction and structuring for best shop name
             final_text = self.structure_text(' '.join(all_texts))
             print(f"[Extract] Final structured text: {final_text}")
             business_type = self.get_business_type(final_text)
             print(f"[Extract] Detected business type: {business_type}")
-            
-            return [final_text], Image.fromarray(cv2.cvtColor(signboard, cv2.COLOR_BGR2RGB)), business_type
-            
+            self.last_confidences = all_confs
+            return [final_text], Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)), business_type
+
         except Exception as e:
             print(f"[Extract] Error: {e}")
             return ["Error processing image"], self.get_default_image(), "shop"
@@ -951,16 +963,15 @@ class TextProcessor:
             return word.upper()
 
     def structure_text(self, text):
-        """Enhanced text structuring with BERT verification"""
+        """Enhanced text structuring with BERT verification and better cleaning"""
         print(f"[Structure] Input text: {text}")
         try:
-            # First pass: Clean and group words
+            # Clean and group words, remove noise and short words
             words = []
             for word in text.split():
-                # Remove noise
-                word = re.sub(r'[^A-Za-z\s]', '', word)
+                # Remove noise and special chars (including ~, _, etc.)
+                word = re.sub(r'[^A-Za-z0-9&]', '', word)  # allow letters, numbers, and &
                 word = word.strip().upper()
-                
                 if len(word) >= 3 and not any(c.isdigit() for c in word):
                     # Group similar words
                     similar_found = False
@@ -974,7 +985,6 @@ class TextProcessor:
             # Second pass: Identify business name and type
             name_words = []
             type_words = []
-            
             for word in words:
                 # Check if it's a shop type word
                 is_type = False
@@ -985,8 +995,6 @@ class TextProcessor:
                             type_words.append(corrected)
                             is_type = True
                             break
-                
-                # If not a type, consider it part of business name
                 if not is_type:
                     corrected = self._bert_verify_word(word)
                     if corrected and len(corrected) >= 3:
@@ -1005,7 +1013,6 @@ class TextProcessor:
             final_text = ' '.join(final_words)
             print(f"[Structure] Final text: {final_text}")
             return final_text if final_text else "Unknown"
-            
         except Exception as e:
             print(f"[Structure] Error: {str(e)}")
             return "Unknown"

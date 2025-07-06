@@ -7,6 +7,7 @@ from text_processor_llm import TextProcessorLLM
 import shutil
 import hashlib
 import asyncio
+from batch_pdf_report import process_images_and_generate_pdf
 
 # Initialize processors
 @st.cache_resource
@@ -99,6 +100,25 @@ def search_page(db):
         else:
             st.info("No images found for this word")
 
+def batch_pdf_page(local_processor, llm_processor):
+    st.header("Batch Image Processing & PDF Report")
+    uploaded_files = st.file_uploader("Upload multiple images", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+    gemini_api_key = st.secrets["GEMINI_API_KEY"]
+    if uploaded_files:
+        temp_dir = "batch_temp"
+        os.makedirs(temp_dir, exist_ok=True)
+        image_paths = []
+        for file in uploaded_files:
+            path = os.path.join(temp_dir, file.name)
+            with open(path, "wb") as f:
+                f.write(file.getbuffer())
+            image_paths.append(path)
+        if st.button("Generate PDF Report"):
+            output_pdf = os.path.join(temp_dir, "batch_report.pdf")
+            process_images_and_generate_pdf(image_paths, gemini_api_key, output_pdf)
+            with open(output_pdf, "rb") as f:
+                st.download_button("Download PDF Report", f, file_name="batch_report.pdf", mime="application/pdf")
+
 def main():
     st.title("Image Text Extractor and Organizer")
     
@@ -117,10 +137,12 @@ def main():
     
     # Add sidebar navigation
     st.sidebar.title("Navigation")
-    page = st.sidebar.radio("Go to", ["Upload", "Search"])
+    page = st.sidebar.radio("Go to", ["Upload", "Search", "Batch PDF"])
     
     if page == "Upload":
         upload_page(db, processor)
+    elif page == "Batch PDF":
+        batch_pdf_page(local_processor, llm_processor)
     else:
         search_page(db)
 
